@@ -32,17 +32,26 @@ from sklearn.decomposition import PCA # for PCA feature extraction
 from sklearn.manifold import TSNE
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.decomposition import FastICA
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import cross_validate, KFold
+from sklearn.metrics import make_scorer, accuracy_score, precision_score, recall_score, f1_score, matthews_corrcoef, roc_auc_score
+from sklearn.tree import DecisionTreeClassifier
+import tracemalloc
+from sklearn.feature_selection import mutual_info_classif
+import joblib
+from sklearn.model_selection import StratifiedGroupKFold
 
 # importing libraries for the LSTM model that would be used
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.layers import LSTM
+from keras.models import Sequential, Model
 from keras.layers import Input, Dense, LSTM
-from keras.models import Model
 from scikeras.wrappers import KerasClassifier
 
+from sklearn.utils import resample
+from scipy.stats import sem, t
 
-np.random.seed(10) #for consistency by ensuring same random values are generarted when needed
+
+seed = 10
+np.random.seed(seed) #for consistency by ensuring same random values are generarted when needed
 
 # read fasta files to list
 def readFasta(input_file):
@@ -53,6 +62,20 @@ def readFasta(input_file):
         one_sequence = [name, sequence]
         all_sequences.append(one_sequence)
     return all_sequences
+
+# group protein sequences
+from collections import defaultdict
+def groupProteinSequences(sequences, start_group_id):
+    groups = defaultdict(list)
+    group_ids = []
+
+    for name, sequence in sequences:
+        groups[sequence].append(name)
+
+    for group_id, (_, sequences) in enumerate(groups.items(), start=start_group_id):
+        group_ids.extend([group_id] * len(sequences))
+
+    return groups, group_ids
 
 # validate protein sequence
 def protcheck(seq):
@@ -83,6 +106,7 @@ def generateFeatures(input_path, output_path):
     # os.system("python iFeature/iFeature.py --file "+input_path+" --type CKSAAP --out "+output_path)
     # 0 in the code below shows that the composition of k-spaced AAP is with k=0
     os.system("python iFeature/codes/CKSAAP.py "+input_path+" 0 "+output_path)
+    # os.system("python iFeature/iFeature.py --file "+input_path+" --type AAC --out "+output_path)
     return output_path
 
 # converts protein sequence from list to fasta format
@@ -107,7 +131,7 @@ def deleteDir(dir_path):
         print("Error: %s - %s." % (e.filename, e.strerror))
 
 # creating baseline model for the LSTM deep neural network model with 1 hidden layer of 100neurons
-def lstm_baseline_model(X_train):
+def lstm_baseline_model_old(X_train):
     # create model
     model = Sequential()
     model.add(LSTM(100, input_shape=(X_train.shape[1], 1), activation='relu'))
@@ -116,3 +140,114 @@ def lstm_baseline_model(X_train):
     # Compile model
     model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
     return model
+
+def lstm_baseline_model(dim):
+    # Define the model architecture
+    model = Sequential()
+    model.add(LSTM(units=dim, activation='relu', return_sequences=True, input_shape=(dim, 1)))
+    model.add(LSTM(units=dim * 0.8, activation='relu', return_sequences=True))
+    model.add(LSTM(units=dim * 0.6, activation='relu', return_sequences=True))
+    model.add(LSTM(units=dim * 0.4, activation='relu', return_sequences=True))
+    model.add(LSTM(units=dim * 0.2, activation='relu', return_sequences=True))
+    model.add(LSTM(units=dim * 0.1, activation='relu', return_sequences=False))
+    model.add(Dense(units=1, activation='sigmoid'))
+
+    # Compile model
+    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+    return model
+
+def custom_scorer(y_true, y_pred, custom_metric):
+    if custom_metric == "accuracy":
+        return metrics.accuracy_score(y_true, y_pred)
+    elif custom_metric == "sensitivity":
+        return metrics.recall_score(y_true, y_pred)
+    elif custom_metric == "specificity":
+        return metrics.recall_score(y_true, y_pred, pos_label=0)
+    elif custom_metric == "precision":
+        return metrics.precision_score(y_true, y_pred)
+    elif custom_metric == "f1":
+        return metrics.f1_score(y_true, y_pred)
+    elif custom_metric == "mcc":
+        return metrics.matthews_corrcoef(y_true, y_pred)
+    elif custom_metric == "auroc":
+        return metrics.roc_auc_score(y_true, y_pred)
+    else:
+        return
+
+def multicollinearity(X):
+    corr_matrix = X.corr().abs()
+
+    # Select the upper triangle of the correlation matrix
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+    # Find features with high correlation (threshold can be adjusted based on the need)
+    to_drop = [column for column in upper.columns if any(upper[column] > 0.8)]
+
+    # Create the new dataset with the selected features
+    X_mc = X.drop(to_drop, axis=1)
+
+    # Print the list of dropped features
+    print("Features dropped due to multicollinearity: ", to_drop)
+    return X_mc
+
+def information_gain(X, y):
+    # Calculate the mutual information between each feature and the target
+    ig_scores = mutual_info_classif(X, y)
+    return ig_scores
+
+    # # Sort the features by their information gain score in descending order
+    # sorted_indices = sorted(range(len(ig_scores)), key=lambda i: ig_scores[i], reverse=True)
+    #
+    # # Return the top 1000 feature indices and their corresponding information gain scores
+    # top_indices = sorted_indices[:1000]
+    # top_scores = ig_scores[top_indices]
+    #
+    # return top_indices, top_scores
+
+
+# def information_gain(X, y):
+#     # Calculate the mutual information between each feature and the target
+#     ig_scores = mutual_info_classif(X, y)
+#
+#     # Sort the features by their information gain score in descending order
+#     sorted_indices = sorted(range(len(ig_scores)), key=lambda i: ig_scores[i], reverse=True)
+#
+#     # Return the top 1000 feature indices and their corresponding information gain scores
+#     top_indices = sorted_indices[:1000]
+#     top_scores = ig_scores[top_indices]
+#
+#     return top_indices, top_scores
+
+# from statsmodels.stats.outliers_influence import variance_inflation_factor
+# def calc_vif(X):
+#     # Add a small constant value to the diagonal of the correlation matrix to avoid divide-by-zero errors
+#     corr = X.corr() + 0.01 * np.identity(X.shape[1])
+#
+#     # Calculate the VIF scores
+#     vif = [variance_inflation_factor(corr.values, i) for i in range(corr.shape[0])]
+#
+#     # Select the features with VIF scores below a threshold (number can be adjusted based on the need)
+#     selected_features = X.columns[vif < 5]
+#
+#     # Create the new dataset with the selected features and target variable
+#     return X[selected_features]
+
+# works for python version >3.10 and I currently have 3.9
+# def custom_scorer(y_true, y_pred, custom_metric):
+#     match custom_metric:
+#         case "accuracy":
+#             return metrics.accuracy_score(y_true, y_pred)
+#         case "sensitivity":
+#             return metrics.recall_score(y_true, y_pred)
+#         case "specificity":
+#             return metrics.recall_score(y_true, y_pred, pos_label=0)
+#         case "precision":
+#             return metrics.precision_score(y_true, y_pred)
+#         case "f1":
+#             return metrics.f1_score(y_true, y_pred)
+#         case "mcc":
+#             return metrics.matthews_corrcoef(y_true, y_pred)
+#         case "auroc":
+#             return metrics.roc_auc_score(y_true, y_pred)
+#         case _:
+#             return
